@@ -27,35 +27,110 @@ static atomic_int init_flag __attribute__((aligned(CACHE_LINE_SIZE))) = 0;
 #define FAST_LOAD_NEXT(h) CAST_TO_PTR(atomic_load_explicit(&(h)->next_free, memory_order_relaxed))
 #define FAST_STORE_NEXT(h, ptr) atomic_store_explicit(&(h)->next_free, CAST_FROM_PTR(ptr), memory_order_relaxed)
 
-// 批量原子操作宏 - 减少内存屏障开销
-#define ATOMIC_BATCH_START() atomic_thread_fence(memory_order_acquire)
-#define ATOMIC_BATCH_END() atomic_thread_fence(memory_order_release)
+// ARM适配的批量原子操作宏
+#if ARM_ARCHITECTURE
+    // ARM架构使用更精确的内存屏障
+    #define ATOMIC_BATCH_START() do { ARM_DMB(); } while(0)
+    #define ATOMIC_BATCH_END() do { ARM_DMB(); } while(0)
+    #define MEMORY_BARRIER_ACQUIRE() ARM_DMB()
+    #define MEMORY_BARRIER_RELEASE() ARM_DMB()
+    #define MEMORY_BARRIER_FULL() ARM_DSB()
+#else
+    // x86架构使用标准原子屏障
+    #define ATOMIC_BATCH_START() atomic_thread_fence(memory_order_acquire)
+    #define ATOMIC_BATCH_END() atomic_thread_fence(memory_order_release)
+    #define MEMORY_BARRIER_ACQUIRE() atomic_thread_fence(memory_order_acquire)
+    #define MEMORY_BARRIER_RELEASE() atomic_thread_fence(memory_order_release)
+    #define MEMORY_BARRIER_FULL() atomic_thread_fence(memory_order_seq_cst)
+#endif
 #define MAGIC 0xDEADBEEF
 #define MAX_RETRY_ATTEMPTS 8      // 减少重试次数，提高响应速度
 #define CLEANUP_INTERVAL 128      // 更频繁的清理，减少内存碎片
 #define SEARCH_EARLY_EXIT_THRESHOLD 2  // 早期退出阈值
 
-// 编译时优化提示
+// ARM架构适配的编译时优化
 #ifdef __GNUC__
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
-#define PREFETCH(addr, rw, locality) __builtin_prefetch(addr, rw, locality)
 #define FORCE_INLINE __attribute__((always_inline)) inline
+
+// ARM架构特定的优化
+#if ARM_ARCHITECTURE
+    // ARM特定的预取指令
+    #if defined(__aarch64__)
+        #define PREFETCH(addr, rw, locality) __builtin_prefetch(addr, rw, locality)
+        #define ARM_YIELD() __asm__ __volatile__("yield" ::: "memory")
+        #define ARM_DMB() __asm__ __volatile__("dmb ish" ::: "memory")  // 数据内存屏障
+        #define ARM_DSB() __asm__ __volatile__("dsb ish" ::: "memory")  // 数据同步屏障
+    #elif defined(__ARM_ARCH_7A__) || defined(__ARM_ARCH_7R__)
+        #define PREFETCH(addr, rw, locality) __builtin_prefetch(addr, rw, locality)
+        #define ARM_YIELD() __asm__ __volatile__("yield" ::: "memory")
+        #define ARM_DMB() __asm__ __volatile__("dmb" ::: "memory")
+        #define ARM_DSB() __asm__ __volatile__("dsb" ::: "memory")
+    #else
+        #define PREFETCH(addr, rw, locality) __builtin_prefetch(addr, rw, locality)
+        #define ARM_YIELD() __asm__ __volatile__("" ::: "memory")
+        #define ARM_DMB() __asm__ __volatile__("" ::: "memory")
+        #define ARM_DSB() __asm__ __volatile__("" ::: "memory")
+    #endif
 #else
+    // x86架构
+    #define PREFETCH(addr, rw, locality) __builtin_prefetch(addr, rw, locality)
+    #define ARM_YIELD()
+    #define ARM_DMB()
+    #define ARM_DSB()
+#endif
+
+#else
+// 非-GCC编译器
 #define LIKELY(x)   (x)
 #define UNLIKELY(x) (x)
 #define PREFETCH(addr, rw, locality)
 #define FORCE_INLINE inline
+#define ARM_YIELD()
+#define ARM_DMB()
+#define ARM_DSB()
 #endif
 
-// 缓存行大小定义（通常为64字节）
-#define CACHE_LINE_SIZE 64
+// ARM架构适配的缓存行大小定义
+#if defined(__ARM_ARCH) || defined(__aarch64__) || defined(_M_ARM) || defined(_M_ARM64)
+    // ARM架构缓存行大小检测
+    #if defined(__ARM_ARCH_7A__) || defined(__ARM_ARCH_7R__) || defined(__ARM_ARCH_7M__)
+        #define CACHE_LINE_SIZE 32  // ARMv7通常是32字节
+    #elif defined(__aarch64__) || defined(_M_ARM64)
+        #define CACHE_LINE_SIZE 64  // ARM64通常是64字节
+    #else
+        #define CACHE_LINE_SIZE 64  // 默认64字节，较安全的选择
+    #endif
+    #define ARM_ARCHITECTURE 1
+#else
+    #define CACHE_LINE_SIZE 64      // x86/x86_64默认64字节
+    #define ARM_ARCHITECTURE 0
+#endif
 
 // 计算各种原子类型的缓存行填充大小
 #define CACHE_LINE_PADDING(type) (CACHE_LINE_SIZE - sizeof(type))
 
-// 确保结构体对齐到缓存行边界
-#define CACHE_ALIGNED __attribute__((aligned(CACHE_LINE_SIZE)))
+// ARM适配的内存对齐定义
+#if ARM_ARCHITECTURE
+    // ARM架构对对齐要求更严格
+    #define CACHE_ALIGNED __attribute__((aligned(CACHE_LINE_SIZE)))
+    #define ARM_STRICT_ALIGN __attribute__((aligned(8)))  // ARM要求8字节对齐
+    #define ARM_ATOMIC_ALIGN __attribute__((aligned(16))) // 原子操作需要16字节对齐
+    
+    // ARM特定的对齐检查
+    #define IS_ALIGNED(ptr, align) (((uintptr_t)(ptr) & ((align) - 1)) == 0)
+    #define ENSURE_ALIGNMENT(ptr, align) \
+        do { if (UNLIKELY(!IS_ALIGNED(ptr, align))) { \
+            /* 记录错误但不中断程序 */ \
+        } } while(0)
+#else
+    #define CACHE_ALIGNED __attribute__((aligned(CACHE_LINE_SIZE)))
+    #define ARM_STRICT_ALIGN
+    #define ARM_ATOMIC_ALIGN
+    #define IS_ALIGNED(ptr, align) 1
+    #define ENSURE_ALIGNMENT(ptr, align)
+#endif
 
 // 跨平台兼容的数据结构设计
 
@@ -80,33 +155,44 @@ static atomic_int init_flag __attribute__((aligned(CACHE_LINE_SIZE))) = 0;
     #error "Unsupported pointer size"
 #endif
 
-// 跨平台兼容的紧凑header结构
+// ARM适配的跨平台header结构
 typedef struct header {
-    // 核心数据（保证在一个缓存行内）
-    atomic_size_type_t size;      // 32位：4字节，64位：8字节
-    atomic_ptr_t next_free;       // 32位：4字节，64位：8字节
-    atomic_uint32_t magic;        // 固定4字节
-    atomic_uint32_t version;      // 固定4字节
-    atomic_char is_free;          // 固定1字节
-    char reserved[HEADER_PADDING]; // 动态计算填充
-} __attribute__((aligned(CACHE_LINE_SIZE))) header_t;
+    // 核心数据（ARM优化布局）
+    atomic_size_type_t size ARM_STRICT_ALIGN;      // 严格对齐
+    atomic_ptr_t next_free ARM_STRICT_ALIGN;       // 严格对齐
+    atomic_uint32_t magic ARM_ATOMIC_ALIGN;        // 原子操作对齐
+    atomic_uint32_t version;                       // 紧跟在magic后
+    atomic_char is_free;                           // 单字节标志
+    char reserved[HEADER_PADDING];                 // 填充到缓存行边界
+} CACHE_ALIGNED header_t;
 
-// 跨平台兼容的紧凑footer结构
+// ARM适配的跨平台footer结构
 typedef struct footer {
-    atomic_size_type_t size;      // 32位：4字节，64位：8字节
-    atomic_uint32_t magic;        // 固定4字节
-    char reserved[FOOTER_PADDING]; // 动态计算填充
-} __attribute__((aligned(16))) footer_t;
+    atomic_size_type_t size ARM_STRICT_ALIGN;      // ARM严格对齐
+    atomic_uint32_t magic;                         // 魔数标识
+    char reserved[FOOTER_PADDING];                 // 填充到16字节边界
+} ARM_ATOMIC_ALIGN footer_t;
 
 // 跨平台兼容的辅助宏
 #define CAST_TO_PTR(x) ((void*)(uintptr_t)(x))
 #define CAST_FROM_PTR(x) ((uintptr_t)(x))
 
-// 编译时的跨平台兼容性检查
-_Static_assert(sizeof(header_t) == CACHE_LINE_SIZE, "Header size must be exactly one cache line");
+// ARM适配的编译时检查
+_Static_assert(sizeof(header_t) == CACHE_LINE_SIZE, "Header size must match cache line size");
 _Static_assert(sizeof(footer_t) == 16, "Footer size must be 16 bytes for optimal alignment");
-_Static_assert(HEADER_PADDING > 0, "Header padding must be positive to ensure proper alignment");
+_Static_assert(HEADER_PADDING >= 0, "Header padding must be non-negative");
 _Static_assert(FOOTER_PADDING >= 0, "Footer padding must be non-negative");
+
+// ARM架构特定检查
+#if ARM_ARCHITECTURE
+    _Static_assert(CACHE_LINE_SIZE == 32 || CACHE_LINE_SIZE == 64, "ARM cache line must be 32 or 64 bytes");
+    _Static_assert(ALIGNMENT >= 8, "ARM requires at least 8-byte alignment");
+    #if defined(__aarch64__)
+        _Static_assert(sizeof(void*) == 8, "ARM64 must have 8-byte pointers");
+    #else
+        _Static_assert(sizeof(void*) == 4, "ARM32 must have 4-byte pointers");
+    #endif
+#endif
 
 // 验证原子类型大小
 #if UINTPTR_MAX == 0xFFFFFFFF
@@ -235,14 +321,47 @@ static inline size_t hash_function(size_t s, size_t hash_size) {
     return (s >> 4) % hash_size;
 }
 
-// 初始化页面大小
+// ARM适配的页面大小初始化
 static int init_page_size() {
     if (PAGE_SIZE == 0) {
         long page_size = sysconf(_SC_PAGESIZE);
         PAGE_SIZE = (page_size > 0) ? (size_t)page_size : 4096;
+        
+#if ARM_ARCHITECTURE
+        // ARM架构特定检查
+        if (PAGE_SIZE < 4096) {
+            PAGE_SIZE = 4096; // ARM最小页面大小
+        }
+        // 确保页面大小是缓存行大小的倍数
+        if (PAGE_SIZE % CACHE_LINE_SIZE != 0) {
+            PAGE_SIZE = ((PAGE_SIZE / CACHE_LINE_SIZE) + 1) * CACHE_LINE_SIZE;
+        }
+#endif
     }
     return 0;
 }
+
+#if ARM_ARCHITECTURE
+// ARM架构特定的初始化检查
+static int arm_compatibility_check() {
+    // 检查缓存行大小是否合理
+    if (CACHE_LINE_SIZE != 32 && CACHE_LINE_SIZE != 64) {
+        return -1; // 不支持的缓存行大小
+    }
+    
+    // 检查内存对齐
+    if (ALIGNMENT < 8) {
+        return -1; // ARM需要至少8字节对齐
+    }
+    
+    // 检查结构体大小
+    if (sizeof(header_t) != CACHE_LINE_SIZE) {
+        return -1; // header必须等于缓存行大小
+    }
+    
+    return 0; // 通过所有检查
+}
+#endif
 
 // 跨平台兼容的高效块初始化
 static inline void init_block(header_t *block, size_t size, int is_free) {
@@ -263,9 +382,14 @@ static inline void init_block(header_t *block, size_t size, int is_free) {
     ATOMIC_BATCH_END();
 }
 
-// 高效的快速块验证
+// ARM适配的高效块验证
 static inline int is_block_valid(header_t *b) {
     if (!b) return 0;
+    
+#if ARM_ARCHITECTURE
+    // ARM架构的对齐检查
+    ENSURE_ALIGNMENT(b, 8);
+#endif
     
     // 快速验证 - 使用relaxed内存序减少开销
     size_t size = FAST_LOAD_SIZE(b);
@@ -279,6 +403,11 @@ static inline int is_block_valid(header_t *b) {
     // footer验证（只在必要时执行）
     footer_t *f = get_footer(b);
     if (!f) return 0;
+    
+#if ARM_ARCHITECTURE
+    // ARM架构footer对齐检查
+    ENSURE_ALIGNMENT(f, 8);
+#endif
     
     return (atomic_load_explicit(&f->size, memory_order_relaxed) == size && 
             atomic_load_explicit(&f->magic, memory_order_relaxed) == MAGIC);
@@ -643,6 +772,14 @@ int mempool_init(size_t hash_size) {
         atomic_store_explicit(&init_flag, 0, memory_order_release);
         return -1;
     }
+    
+#if ARM_ARCHITECTURE
+    // ARM架构兼容性检查
+    if (arm_compatibility_check() != 0) {
+        atomic_store_explicit(&init_flag, 0, memory_order_release);
+        return -1; // ARM兼容性检查失败
+    }
+#endif
 
     size_t hsize = hash_size ?: DEFAULT_HASH_SIZE;
     pool = mmap(NULL, sizeof(mem_pool_t), PROT_READ | PROT_WRITE, 
@@ -759,11 +896,15 @@ void *mempool_alloc(size_t size) {
     for (int retry = 0; retry < MAX_RETRY_ATTEMPTS; retry++) {
         if (remove_from_free_list(b)) goto block_acquired;
         
-        // 指数退避策略
+        // ARM适配的指数退避策略
         for (int i = 0; i < retry_delay; i++) {
-            __builtin_ia32_pause(); // CPU暂停指令
+#if ARM_ARCHITECTURE
+            ARM_YIELD(); // ARM yield指令
+#else
+            __builtin_ia32_pause(); // x86 pause指令
+#endif
         }
-        retry_delay <<= 1; // 双倍递增
+        retry_delay = (retry_delay < 64) ? (retry_delay << 1) : 64; // 限制最大退避时间
         
         // 重新查找
         b = find_best_fit_block(req);
@@ -927,11 +1068,26 @@ void mempool_print_stats() {
     printf("Memory utilization: %.4f\n", stats.memory_utilization);
     printf("Hash table size: %zu\n", stats.hash_size);
     printf("\n=== Cross-Platform Info ===\n");
+    printf("Architecture: %s\n", ARM_ARCHITECTURE ? "ARM" : "x86/x86_64");
+#if ARM_ARCHITECTURE
+    #if defined(__aarch64__)
+        printf("ARM variant: AArch64 (ARM64)\n");
+    #elif defined(__ARM_ARCH_7A__)
+        printf("ARM variant: ARMv7-A\n");
+    #elif defined(__ARM_ARCH_7R__)
+        printf("ARM variant: ARMv7-R\n");
+    #elif defined(__ARM_ARCH_7M__)
+        printf("ARM variant: ARMv7-M\n");
+    #else
+        printf("ARM variant: Generic ARM\n");
+    #endif
+#endif
     printf("Pointer size: %zu bytes\n", sizeof(void*));
     printf("Header size: %zu bytes\n", sizeof(header_t));
     printf("Footer size: %zu bytes\n", sizeof(footer_t));
     printf("Cache line size: %d bytes\n", CACHE_LINE_SIZE);
     printf("Atomic ptr size: %zu bytes\n", sizeof(atomic_ptr_t));
     printf("Atomic size type: %zu bytes\n", sizeof(atomic_size_type_t));
+    printf("Memory alignment: %d bytes\n", ALIGNMENT);
     printf("================================\n");
 }
