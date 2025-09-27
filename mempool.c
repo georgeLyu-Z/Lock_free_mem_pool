@@ -21,6 +21,7 @@ static atomic_int init_flag __attribute__((aligned(CACHE_LINE_SIZE))) = 0;
 #define MIN_BLOCK_SIZE (sizeof(header_t) + sizeof(footer_t))
 #define MAGIC 0xDEADBEEF
 #define MAX_RETRY_ATTEMPTS 10
+#define CLEANUP_INTERVAL 256  // 每256次操作清理一次空页面
 
 // 缓存行大小定义（通常为64字节）
 #define CACHE_LINE_SIZE 64
@@ -135,9 +136,13 @@ static inline uintptr_t align_up(uintptr_t v, size_t a) {
     return (v + a - 1) & ~(uintptr_t)(a - 1);
 }
 
-// 优化的哈希函数
+// 优化的哈希函数 - 使用位运算优化
 static inline size_t hash_function(size_t s, size_t hash_size) {
-    return s % hash_size;  // 简化哈希函数，对于内存池足够高效
+    // 对于2的幂次方大小，使用位运算
+    if ((hash_size & (hash_size - 1)) == 0) {
+        return s & (hash_size - 1);
+    }
+    return s % hash_size;
 }
 
 // 初始化页面大小
@@ -324,7 +329,9 @@ static void free_empty_pages() {
 static header_t *allocate_page() {
     void *page = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, 
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (page == MAP_FAILED) return NULL;
+    if (page == MAP_FAILED) {
+        return NULL;
+    }
 
     page_header_t *ph = page;
     STORE_PTR(&ph->next, LOAD_PTR(&pool->page_list));
@@ -332,6 +339,7 @@ static header_t *allocate_page() {
     atomic_store_explicit(&ph->block_count, 1, memory_order_release);
     atomic_store_explicit(&ph->version, 0, memory_order_release);
     
+    // 原子地将页面添加到页面列表
     uintptr_t expected = LOAD_PTR(&pool->page_list);
     uintptr_t desired = (uintptr_t)ph;
     if (!CAS_PTR(&pool->page_list, &expected, desired)) {
@@ -347,7 +355,9 @@ static header_t *allocate_page() {
     
     init_block(b, block_size, 1);
     
+    // 尝试将块添加到空闲列表
     if (!add_to_free_list(b)) {
+        // 清理：从页面列表中移除页面
         uintptr_t current = LOAD_PTR(&pool->page_list);
         if (current == (uintptr_t)ph) {
             uintptr_t next = LOAD_PTR(&ph->next);
@@ -357,6 +367,7 @@ static header_t *allocate_page() {
         return NULL;
     }
     
+    // 更新统计信息
     UPDATE_STATS(pool, 0, block_size, 0);
     atomic_fetch_add_explicit(&pool->total_pages, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&pool->active_pages, 1, memory_order_relaxed);
@@ -380,10 +391,10 @@ static header_t *find_best_fit_block(size_t s) {
             size_t cur_size = atomic_load_explicit(&cur->size, memory_order_acquire);
             if (cur_size >= s) {
                 size_t diff = cur_size - s;
+                if (diff == 0) return cur; // 精确匹配，立即返回
                 if (diff < min_diff) {
                     min_diff = diff;
                     best = cur;
-                    if (diff == 0) return best; // 完全匹配
                 }
             }
         }
@@ -405,10 +416,10 @@ static header_t *find_best_fit_block(size_t s) {
                 size_t cur_size = atomic_load_explicit(&cur->size, memory_order_acquire);
                 if (cur_size >= s) {
                     size_t diff = cur_size - s;
+                    if (diff == 0) return cur; // 精确匹配，立即返回
                     if (diff < min_diff) {
                         min_diff = diff;
                         best = cur;
-                        if (diff == 0) return best;
                     }
                 }
             }
@@ -425,10 +436,10 @@ static header_t *find_best_fit_block(size_t s) {
                 size_t cur_size = atomic_load_explicit(&cur->size, memory_order_acquire);
                 if (cur_size >= s) {
                     size_t diff = cur_size - s;
+                    if (diff == 0) return cur; // 精确匹配，立即返回
                     if (diff < min_diff) {
                         min_diff = diff;
                         best = cur;
-                        if (diff == 0) return best;
                     }
                 }
             }
@@ -544,41 +555,57 @@ void mempool_destroy() {
 }
 
 void *mempool_alloc(size_t size) {
+    // 参数验证
     if (!size || !pool || !atomic_load_explicit(&pool->is_initialized, memory_order_acquire)) {
         return NULL;
     }
 
+    // 计算对齐后的请求大小
     size_t req = align_up(size + sizeof(header_t) + sizeof(footer_t), ALIGNMENT);
     req = req < MIN_BLOCK_SIZE ? MIN_BLOCK_SIZE : req;
     
+    // 查找最佳匹配块
     header_t *b = find_best_fit_block(req);
     
-    if (!b && !allocate_page()) {
-        return NULL;
-    }
-    
+    // 如果没有找到合适的块，尝试分配新页面
     if (!b) {
+        if (!allocate_page()) {
+            return NULL;
+        }
         b = find_best_fit_block(req);
+        if (!b) {
+            return NULL;
+        }
     }
-
-    if (!b) return NULL;
 
     // 尝试从空闲列表中移除块
     for (int retry = 0; retry < MAX_RETRY_ATTEMPTS; retry++) {
-        if (remove_from_free_list(b)) break;
+        if (remove_from_free_list(b)) {
+            break;
+        }
+        // 如果移除失败，重新查找块
         b = find_best_fit_block(req);
-        if (!b) return NULL;
+        if (!b) {
+            return NULL;
+        }
     }
     
     size_t original_size = atomic_load_explicit(&b->size, memory_order_acquire);
     
-    // 块拆分
+    // 块拆分优化：只在剩余空间足够大时拆分
     if (original_size - req >= MIN_BLOCK_SIZE) {
         header_t *nb = (header_t *)((char *)b + req);
         init_block(nb, original_size - req, 1);
         init_block(b, req, 0);
-        add_to_free_list(nb); // 忽略返回值
-        UPDATE_STATS(pool, req, -original_size, 1);
+        
+        // 将新块添加到空闲列表
+        if (!add_to_free_list(nb)) {
+            // 如果添加失败，合并回原块
+            init_block(b, original_size, 0);
+            UPDATE_STATS(pool, original_size, -original_size, 0);
+        } else {
+            UPDATE_STATS(pool, req, -original_size, 1);
+        }
     } else {
         init_block(b, original_size, 0);
         UPDATE_STATS(pool, original_size, -original_size, 0);
@@ -641,7 +668,7 @@ void mempool_free(void *ptr) {
 
     // 定期清理空页面 - 静态原子变量独占缓存行
     static atomic_int cleanup_counter __attribute__((aligned(CACHE_LINE_SIZE))) = 0;
-    if (atomic_fetch_add_explicit(&cleanup_counter, 1, memory_order_relaxed) % 256 == 0) {
+    if (atomic_fetch_add_explicit(&cleanup_counter, 1, memory_order_relaxed) % CLEANUP_INTERVAL == 0) {
         free_empty_pages();
     }
 }
